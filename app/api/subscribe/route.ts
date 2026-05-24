@@ -1,6 +1,25 @@
 import { NextResponse } from "next/server";
+import { Ratelimit } from "@upstash/ratelimit";
+import { Redis } from "@upstash/redis";
 
 export const runtime = "edge";
+
+// Rate limiter is lazily constructed so the route still loads when
+// env vars are missing (local dev). 5 requests per IP per hour.
+let ratelimit: Ratelimit | null = null;
+function getRateLimit(): Ratelimit | null {
+  if (ratelimit) return ratelimit;
+  const url = process.env.UPSTASH_REDIS_REST_URL;
+  const token = process.env.UPSTASH_REDIS_REST_TOKEN;
+  if (!url || !token) return null;
+  ratelimit = new Ratelimit({
+    redis: new Redis({ url, token }),
+    limiter: Ratelimit.slidingWindow(5, "1 h"),
+    analytics: true,
+    prefix: "sfi26:subscribe",
+  });
+  return ratelimit;
+}
 
 type SubscribePayload = {
   email: string;
@@ -91,11 +110,42 @@ export async function POST(req: Request) {
     return NextResponse.json({ error: "Invalid email" }, { status: 400 });
   }
 
-  // Cloudflare Turnstile bot check. Skipped if no secret configured (local dev).
   const remoteIp =
     req.headers.get("cf-connecting-ip") ??
     req.headers.get("x-forwarded-for")?.split(",")[0]?.trim() ??
     null;
+
+  // Rate limit by IP. Skipped if Upstash isn't configured (local dev).
+  const limiter = getRateLimit();
+  if (limiter && remoteIp) {
+    const { success, reset, remaining } = await limiter.limit(remoteIp);
+    if (!success) {
+      const retryAfterSeconds = Math.max(
+        1,
+        Math.ceil((reset - Date.now()) / 1000),
+      );
+      console.warn(
+        "Rate limited",
+        remoteIp,
+        "remaining=",
+        remaining,
+        "retry in",
+        retryAfterSeconds,
+        "s",
+      );
+      return NextResponse.json(
+        {
+          error: "Too many submissions from your network. Please try again later.",
+        },
+        {
+          status: 429,
+          headers: { "Retry-After": String(retryAfterSeconds) },
+        },
+      );
+    }
+  }
+
+  // Cloudflare Turnstile bot check. Skipped if no secret configured (local dev).
   const verify = await verifyTurnstile(body.turnstileToken, remoteIp);
   if (!verify.ok) {
     console.warn("Turnstile rejected:", verify.reason, "for", body.email);

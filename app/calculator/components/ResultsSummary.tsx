@@ -6,6 +6,7 @@ import {
   UNIT_QUANTITY_LABELS,
 } from "../../lib/types";
 import type { EligibilityResult } from "./EligibilityCheck";
+import EmailCapture from "./EmailCapture";
 
 export default function ResultsSummary({
   result,
@@ -175,6 +176,12 @@ export default function ResultsSummary({
           </ul>
         </div>
       )}
+
+      <EmailCapture
+        farmSizeHa={result.totalAgriculturalAreaHa}
+        estimatedPayment={result.finalPayment}
+        window={eligibility?.window ?? null}
+      />
 
       <div className="mt-10 rounded-lg border border-stone-200 bg-stone-50 p-4 text-xs text-stone-600">
         Reminder: this is an <strong>estimate</strong>, not financial advice.

@@ -8,11 +8,54 @@ type SubscribePayload = {
   farmSizeHa?: number;
   estimatedPayment?: number;
   window?: "window1" | "window2" | "ineligible" | null;
+  // Bot-defence fields:
+  company?: string; // honeypot — must be empty
+  turnstileToken?: string | null;
 };
 
 const RESEND_BASE = "https://api.resend.com";
 const NOTION_BASE = "https://api.notion.com";
 const NOTION_VERSION = "2022-06-28";
+const TURNSTILE_VERIFY_URL =
+  "https://challenges.cloudflare.com/turnstile/v0/siteverify";
+
+async function verifyTurnstile(
+  token: string | undefined | null,
+  remoteIp: string | null,
+): Promise<{ ok: boolean; reason?: string }> {
+  const secret = process.env.TURNSTILE_SECRET_KEY;
+  if (!secret) {
+    // No secret configured (e.g. local dev / preview) — skip verification.
+    return { ok: true, reason: "no-secret" };
+  }
+  if (!token) return { ok: false, reason: "missing-token" };
+
+  const form = new URLSearchParams();
+  form.append("secret", secret);
+  form.append("response", token);
+  if (remoteIp) form.append("remoteip", remoteIp);
+
+  try {
+    const res = await fetch(TURNSTILE_VERIFY_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: form.toString(),
+    });
+    const data = (await res.json().catch(() => null)) as
+      | { success?: boolean; "error-codes"?: string[] }
+      | null;
+    if (!data || !data.success) {
+      return {
+        ok: false,
+        reason: data?.["error-codes"]?.join(",") ?? "verify-failed",
+      };
+    }
+    return { ok: true };
+  } catch (err) {
+    console.error("Turnstile verify threw:", err);
+    return { ok: false, reason: "verify-threw" };
+  }
+}
 
 function windowToNotionSelect(
   w: SubscribePayload["window"],
@@ -37,8 +80,29 @@ export async function POST(req: Request) {
     return NextResponse.json({ error: "Invalid JSON" }, { status: 400 });
   }
 
+  // Honeypot: real users never fill this. Bots almost always do.
+  // Return 200 OK silently so the bot doesn't retry or learn it's been caught.
+  if (typeof body.company === "string" && body.company.trim().length > 0) {
+    console.warn("Honeypot triggered for", body.email);
+    return NextResponse.json({ ok: true });
+  }
+
   if (!isValidEmail(body.email)) {
     return NextResponse.json({ error: "Invalid email" }, { status: 400 });
+  }
+
+  // Cloudflare Turnstile bot check. Skipped if no secret configured (local dev).
+  const remoteIp =
+    req.headers.get("cf-connecting-ip") ??
+    req.headers.get("x-forwarded-for")?.split(",")[0]?.trim() ??
+    null;
+  const verify = await verifyTurnstile(body.turnstileToken, remoteIp);
+  if (!verify.ok) {
+    console.warn("Turnstile rejected:", verify.reason, "for", body.email);
+    return NextResponse.json(
+      { error: "Bot check failed. Please refresh and try again." },
+      { status: 403 },
+    );
   }
 
   const apiKey = process.env.RESEND_API_KEY;

@@ -11,6 +11,17 @@ type SubscribePayload = {
 };
 
 const RESEND_BASE = "https://api.resend.com";
+const NOTION_BASE = "https://api.notion.com";
+const NOTION_VERSION = "2022-06-28";
+
+function windowToNotionSelect(
+  w: SubscribePayload["window"],
+): "Window 1" | "Window 2" | "Ineligible" | "Unknown" {
+  if (w === "window1") return "Window 1";
+  if (w === "window2") return "Window 2";
+  if (w === "ineligible") return "Ineligible";
+  return "Unknown";
+}
 
 function isValidEmail(email: string): boolean {
   if (typeof email !== "string") return false;
@@ -120,6 +131,46 @@ export async function POST(req: Request) {
       });
     } catch (err) {
       console.error("Resend notify email failed (non-fatal):", err);
+    }
+  }
+
+  // 3. Best-effort write to Notion leads database for structured triage.
+  //    Failure here must not block the user-facing success path.
+  const notionToken = process.env.NOTION_TOKEN;
+  const notionDatabaseId = process.env.NOTION_DATABASE_ID;
+  if (notionToken && notionDatabaseId) {
+    const properties: Record<string, unknown> = {
+      Email: { title: [{ text: { content: email } }] },
+      "Marketing consent": { checkbox: consent },
+      Window: { select: { name: windowToNotionSelect(body.window) } },
+      Status: { select: { name: "New" } },
+    };
+    if (body.farmSizeHa != null) {
+      properties["Farm size (ha)"] = { number: body.farmSizeHa };
+    }
+    if (body.estimatedPayment != null) {
+      properties["Estimated payment"] = { number: body.estimatedPayment };
+    }
+
+    try {
+      const notionRes = await fetch(`${NOTION_BASE}/v1/pages`, {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${notionToken}`,
+          "Notion-Version": NOTION_VERSION,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          parent: { database_id: notionDatabaseId },
+          properties,
+        }),
+      });
+      if (!notionRes.ok) {
+        const text = await notionRes.text().catch(() => "");
+        console.error("Notion write failed (non-fatal):", notionRes.status, text);
+      }
+    } catch (err) {
+      console.error("Notion write threw (non-fatal):", err);
     }
   }
 
